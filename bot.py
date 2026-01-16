@@ -1,4 +1,5 @@
 import asyncio
+import binascii
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 MAX_GAS_GWEI = Decimal(os.getenv("MAX_GAS_GWEI", "3"))
 CONTRACT_ADDRESS = "0x7C9a7130379F1B5dd6e7A53AF84fC0fE32267B65"
 EPOCH_DURATION = 2304  # 38.4 minutes in seconds
+FLUSHED_TOPIC_HASH = "0xbf22ffbd5b2510ba175b84f0b24b0cf8d8f6eb19e2d498257976a51cc6660bf0"
 
 # Helper: Load ABI
 try:
@@ -62,6 +64,111 @@ class EliteBot:
         self.nonce = None
         self.last_flush_time = 0
         self.last_checked_block = 0
+        self.last_scan_time = 0
+
+    async def scan_range(self, from_block, to_block):
+        """
+        Helper to scan a range of blocks for the Flushed event.
+        Returns list of events or empty list.
+        """
+        try:
+            logs = await self.w3.eth.get_logs({
+                'address': CONTRACT_ADDRESS,
+                'topics': [FLUSHED_TOPIC_HASH],
+                'fromBlock': from_block,
+                'toBlock': to_block
+            })
+            return logs
+        except (binascii.Error, Exception) as e:
+            logger.warning(f"Error scanning range {from_block}-{to_block}: {e}")
+            return []
+
+    async def perform_deep_scan(self):
+        """
+        Deep scan logic:
+        1. Check last 1000 blocks.
+        2. If failed, loop back 5000 blocks at a time up to 50000.
+        Returns: last_flush_timestamp (int) or 0 if not found.
+        """
+        try:
+            current_block = await self.w3.eth.block_number
+            logger.info(f"Starting Deep Scan from block {current_block}...")
+
+            # 1. Check last 1000 blocks
+            start_block = max(0, current_block - 1000)
+            events = await self.scan_range(start_block, current_block)
+
+            if events:
+                last_event = events[-1]
+                logger.info(f"Event found in initial scan at block {last_event['blockNumber']}")
+                blk = await self.w3.eth.get_block(last_event['blockNumber'])
+                self.last_checked_block = current_block
+                return blk['timestamp']
+
+            # 2. Sync Recovery: Loop back up to 50,000 blocks
+            # We already checked up to current-1000.
+            # Next chunk: current-1000-5000 to current-1000
+            offset = 1000
+            limit = 50000
+
+            while offset < limit:
+                end_block = max(0, current_block - offset)
+                start_block = max(0, end_block - 5000)
+
+                if end_block <= 0:
+                    break
+
+                logger.info(f"Scanning history: {start_block} to {end_block}")
+                events = await self.scan_range(start_block, end_block)
+
+                if events:
+                    last_event = events[-1]
+                    logger.info(f"Event found during deep scan at block {last_event['blockNumber']}")
+                    blk = await self.w3.eth.get_block(last_event['blockNumber'])
+                    self.last_checked_block = current_block
+                    return blk['timestamp']
+
+                offset += 5000
+                await asyncio.sleep(0.5) # Slight delay to be nice to RPC
+
+            logger.warning("No Flushed event found in the last 50,000 blocks.")
+            return 0
+
+        except Exception as e:
+            logger.error(f"Deep scan failed: {e}")
+            return 0
+
+    async def scan_recent_blocks(self):
+        """
+        Scans the most recent 1000 blocks.
+        """
+        try:
+            current_block = await self.w3.eth.block_number
+            # Avoid re-scanning if we are up to date?
+            # User requirement: "Search the most recent 1,000 blocks every 2 seconds."
+            # We strictly follow this.
+
+            start_block = max(0, current_block - 1000)
+            events = await self.scan_range(start_block, current_block)
+
+            if events:
+                last_event = events[-1]
+                # Check if this event is newer than our known last_flush_time
+                blk = await self.w3.eth.get_block(last_event['blockNumber'])
+                ts = blk['timestamp']
+
+                if ts > self.last_flush_time:
+                    logger.info(f"New Flushed event detected via poll at {ts}. Resyncing.")
+                    self.last_flush_time = ts
+                    # Reset last_checked_block to current to avoid gap issues if we used it elsewhere,
+                    # though perform_deep_scan sets it.
+                    self.last_checked_block = current_block
+                    return True
+            return False
+
+        except Exception as e:
+            logger.error(f"Recent block scan failed: {e}")
+            return False
 
     async def prepare_transaction(self):
         """
@@ -161,7 +268,7 @@ class EliteBot:
 
     async def run(self):
         """
-        Main bot loop with manual sync logic.
+        Main bot loop with robust scanning and strike logic.
         """
         logger.info("Bot starting...")
 
@@ -172,40 +279,26 @@ class EliteBot:
 
         logger.info(f"Connected to RPC. Address: {self.account.address if self.account else 'None'}")
 
-        # Manual Start Logic
-        self.last_flush_time = time.time()
-        try:
-            self.last_checked_block = await self.w3.eth.block_number
-        except Exception:
-            self.last_checked_block = 0
-
-        logger.info(f"Manual Sync Initialized. Base Time: {self.last_flush_time}")
+        # Initial Sync
+        flush_ts = await self.perform_deep_scan()
+        if flush_ts > 0:
+            self.last_flush_time = flush_ts
+            logger.info(f"Synced from chain. Last Flush: {self.last_flush_time}")
+        else:
+            self.last_flush_time = time.time()
+            logger.warning(f"Could not sync from chain. Fallback to Manual Sync: {self.last_flush_time}")
 
         while True:
             try:
                 now = time.time()
                 next_window = self.last_flush_time + EPOCH_DURATION
 
-                # Periodically check for external flush events to resync
-                try:
-                    current_block = await self.w3.eth.block_number
-                    if self.last_checked_block and current_block > self.last_checked_block:
-                        # Ensure using from_block (snake_case)
-                        events = await self.contract.events.Flushed.get_logs(from_block=self.last_checked_block + 1)
-                        if events:
-                            last_event = events[-1]
-                            # Update last_flush_time based on event timestamp
-                            blk = await self.w3.eth.get_block(last_event['blockNumber'])
-                            self.last_flush_time = blk['timestamp']
-                            next_window = self.last_flush_time + EPOCH_DURATION
-                            logger.info(f"Detected external flush at {self.last_flush_time}. Resyncing. Next window: {next_window}")
-                            self.last_checked_block = current_block
-                            # Reset loop to recalculate with new window
-                            continue
-
-                        self.last_checked_block = current_block
-                except Exception as e:
-                    logger.debug(f"Event check failed: {e}")
+                # Chunked Polling: Search recent 1000 blocks every 2 seconds
+                if now - self.last_scan_time >= 2:
+                    if await self.scan_recent_blocks():
+                        # If resync happened, recalculate next_window immediately
+                        next_window = self.last_flush_time + EPOCH_DURATION
+                    self.last_scan_time = now
 
                 # Check Countdown
                 time_until = next_window - now
@@ -216,14 +309,15 @@ class EliteBot:
                         self.last_flush_time = time.time()
                         logger.info("Strike successful. Timer reset.")
                     else:
-                        logger.info("Strike condition not met or failed. Retrying next tick.")
+                        # logger.info("Strike condition not met or failed. Retrying next tick.")
+                        pass
                 else:
                     # Log occasional status
                     if int(now) % 60 == 0:
                         logger.info(f"Waiting... Time until next window: {time_until:.2f}s")
 
-                # Poll interval
-                await asyncio.sleep(1)
+                # Poll interval for strike logic
+                await asyncio.sleep(0.1)
 
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
