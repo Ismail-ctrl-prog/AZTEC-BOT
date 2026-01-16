@@ -75,8 +75,8 @@ class EliteBot:
             logs = await self.w3.eth.get_logs({
                 'address': CONTRACT_ADDRESS,
                 'topics': [FLUSHED_TOPIC_HASH],
-                'fromBlock': from_block,
-                'toBlock': to_block
+                'from_block': from_block,
+                'to_block': to_block
             })
             return logs
         except (binascii.Error, Exception) as e:
@@ -250,7 +250,7 @@ class EliteBot:
             logger.info("Function is CALLABLE! Striking...")
 
             # Instant Broadcast
-            tx_hash = await self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            tx_hash = await self.w3.eth.send_raw_transaction(signed_tx.raw_transaction)
             logger.info(f"Transaction broadcasted: {self.w3.to_hex(tx_hash)}")
 
             # Wait for receipt
