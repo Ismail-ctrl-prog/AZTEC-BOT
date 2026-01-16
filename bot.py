@@ -21,7 +21,7 @@ logger = logging.getLogger("EliteBot")
 # Load environment variables
 load_dotenv()
 
-RPC_WSS_URL = os.getenv("RPC_WSS_URL")
+RPC_URL = os.getenv("RPC_URL")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 # Default to 3 Gwei if not set.
 MAX_GAS_GWEI = Decimal(os.getenv("MAX_GAS_GWEI", "3"))
@@ -38,8 +38,8 @@ except FileNotFoundError:
 
 class EliteBot:
     def __init__(self):
-        if not RPC_WSS_URL:
-            logger.error("RPC_WSS_URL is not set in .env")
+        if not RPC_URL:
+            logger.error("RPC_URL is not set in .env")
             # We don't exit here to allow dry-run without env in CI/Test
             # But in production it will fail to connect.
 
@@ -47,9 +47,8 @@ class EliteBot:
             logger.error("PRIVATE_KEY is not set in .env")
 
         # Initialize AsyncWeb3
-        if RPC_WSS_URL:
-            # Use AsyncWeb3.WebSocketProvider for async context
-            self.w3 = AsyncWeb3(AsyncWeb3.WebSocketProvider(RPC_WSS_URL))
+        if RPC_URL:
+            self.w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(RPC_URL))
         else:
             # Fallback for testing/linting without URL
             self.w3 = AsyncWeb3()
@@ -201,11 +200,11 @@ class EliteBot:
                     return
 
                 # Interval
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1)
 
             except Exception as e:
                 logger.error(f"Error in poll loop: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(1)
 
     async def run(self):
         """
