@@ -23,8 +23,8 @@ load_dotenv()
 
 RPC_WSS_URL = os.getenv("RPC_WSS_URL")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-# Default to 4 Gwei if not set.
-MAX_GAS_GWEI = Decimal(os.getenv("MAX_GAS_GWEI", "4"))
+# Default to 3 Gwei if not set.
+MAX_GAS_GWEI = Decimal(os.getenv("MAX_GAS_GWEI", "3"))
 CONTRACT_ADDRESS = "0x7C9a7130379F1B5dd6e7A53AF84fC0fE32267B65"
 EPOCH_DURATION = 2304  # 38.4 minutes in seconds
 
