@@ -60,32 +60,8 @@ class EliteBot:
 
         self.contract = self.w3.eth.contract(address=CONTRACT_ADDRESS, abi=CONTRACT_ABI)
         self.nonce = None
-
-    async def get_last_flush_time(self):
-        """
-        Queries the contract events to find the last 'Flushed' event timestamp.
-        """
-        try:
-            current_block = await self.w3.eth.block_number
-            # Look back approx 5000 blocks (~16 hours)
-            from_block = max(0, current_block - 5000)
-
-            # Fetch events
-            events = await self.contract.events.Flushed.get_logs(fromBlock=from_block)
-
-            if not events:
-                logger.warning("No Flushed events found in the last 5000 blocks.")
-                return 0
-
-            # Get the last event
-            last_event = events[-1]
-            block_number = last_event['blockNumber']
-            block = await self.w3.eth.get_block(block_number)
-            return block['timestamp']
-
-        except Exception as e:
-            logger.error(f"Error fetching last flush time: {e}")
-            return 0
+        self.last_flush_time = 0
+        self.last_checked_block = 0
 
     async def prepare_transaction(self):
         """
@@ -141,74 +117,51 @@ class EliteBot:
             logger.error(f"Error preparing transaction: {e}")
             return None
 
-    async def poll_readiness(self, next_epoch_time):
+    async def execute_strike(self):
         """
-        Waits for the countdown and enters high-frequency polling.
+        Attempts to execute the flush transaction immediately.
         """
-        now = time.time()
-        wait_time = next_epoch_time - 30 - now
+        try:
+            # Prepare and sign transaction
+            tx = await self.prepare_transaction()
+            if not tx:
+                logger.error("Transaction preparation failed or gas too high. Skipping strike attempt.")
+                return False
 
-        if wait_time > 0:
-            logger.info(f"Sleeping for {wait_time:.2f}s until pre-strike window...")
-            await asyncio.sleep(wait_time)
+            signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
 
-        logger.info("Entering Pre-Strike Readiness (30s window).")
-
-        # Prepare and sign transaction
-        tx = await self.prepare_transaction()
-        if not tx:
-            logger.error("Transaction preparation failed or gas too high. Skipping this epoch.")
-            return
-
-        signed_tx = self.w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
-        logger.info("Transaction signed and ready.")
-
-        # High-frequency loop
-        # We run until we successfully strike or timeout
-        while True:
+            # Simulation call
             try:
-                # 1. Check if callable (Simulation)
-                # Using call() to simulate execution.
-                try:
-                    await self.contract.functions.flushEntryQueue().call({'from': self.account.address})
-                    # If we reach here, it didn't revert!
-                    logger.info("Function is CALLABLE! Striking...")
-
-                    # 2. Instant Broadcast
-                    tx_hash = await self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
-                    logger.info(f"Transaction broadcasted: {self.w3.to_hex(tx_hash)}")
-
-                    # 3. Wait for receipt
-                    receipt = await self.w3.eth.wait_for_transaction_receipt(tx_hash)
-                    if receipt['status'] == 1:
-                        logger.info(f"Success! Flushed in block {receipt['blockNumber']}")
-                    else:
-                        logger.error(f"Transaction failed (reverted) in block {receipt['blockNumber']}")
-                    return
-
-                except ContractLogicError:
-                    # Still reverted, meaning not yet ready.
-                    pass
-                except Exception as e:
-                    # Unexpected error in call
-                    # logger.debug(f"Simulate error: {e}")
-                    pass
-
-                # Check timeout (e.g., 2 minutes past expected time)
-                if time.time() > next_epoch_time + 120:
-                    logger.warning("Timeout waiting for epoch start.")
-                    return
-
-                # Interval
-                await asyncio.sleep(1)
-
+                await self.contract.functions.flushEntryQueue().call({'from': self.account.address})
+            except ContractLogicError:
+                # Not ready yet
+                return False
             except Exception as e:
-                logger.error(f"Error in poll loop: {e}")
-                await asyncio.sleep(1)
+                logger.warning(f"Simulation error: {e}")
+                return False
+
+            logger.info("Function is CALLABLE! Striking...")
+
+            # Instant Broadcast
+            tx_hash = await self.w3.eth.send_raw_transaction(signed_tx.rawTransaction)
+            logger.info(f"Transaction broadcasted: {self.w3.to_hex(tx_hash)}")
+
+            # Wait for receipt
+            receipt = await self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            if receipt['status'] == 1:
+                logger.info(f"Success! Flushed in block {receipt['blockNumber']}")
+                return True
+            else:
+                logger.error(f"Transaction failed (reverted) in block {receipt['blockNumber']}")
+                return False
+
+        except Exception as e:
+            logger.error(f"Error in execute_strike: {e}")
+            return False
 
     async def run(self):
         """
-        Main bot loop.
+        Main bot loop with manual sync logic.
         """
         logger.info("Bot starting...")
 
@@ -219,36 +172,62 @@ class EliteBot:
 
         logger.info(f"Connected to RPC. Address: {self.account.address if self.account else 'None'}")
 
+        # Manual Start Logic
+        self.last_flush_time = time.time()
+        try:
+            self.last_checked_block = await self.w3.eth.block_number
+        except Exception:
+            self.last_checked_block = 0
+
+        logger.info(f"Manual Sync Initialized. Base Time: {self.last_flush_time}")
+
         while True:
             try:
-                # Sync Epoch
-                last_flush = await self.get_last_flush_time()
-
-                if last_flush == 0:
-                    logger.warning("Could not sync epoch. Retrying in 10s...")
-                    await asyncio.sleep(10)
-                    continue
-
-                next_epoch = last_flush + EPOCH_DURATION
                 now = time.time()
-                time_until = next_epoch - now
+                next_window = self.last_flush_time + EPOCH_DURATION
 
-                logger.info(f"Last Flush: {last_flush}, Next Epoch: {next_epoch}, Time Until: {time_until:.2f}s")
+                # Periodically check for external flush events to resync
+                try:
+                    current_block = await self.w3.eth.block_number
+                    if self.last_checked_block and current_block > self.last_checked_block:
+                        # Ensure using from_block (snake_case)
+                        events = await self.contract.events.Flushed.get_logs(from_block=self.last_checked_block + 1)
+                        if events:
+                            last_event = events[-1]
+                            # Update last_flush_time based on event timestamp
+                            blk = await self.w3.eth.get_block(last_event['blockNumber'])
+                            self.last_flush_time = blk['timestamp']
+                            next_window = self.last_flush_time + EPOCH_DURATION
+                            logger.info(f"Detected external flush at {self.last_flush_time}. Resyncing. Next window: {next_window}")
+                            self.last_checked_block = current_block
+                            # Reset loop to recalculate with new window
+                            continue
 
-                if time_until < -30:
-                    # We are late.
-                    logger.info("Current time is past the target. Checking if we can strike immediately.")
-                    # Try to poll now
-                    await self.poll_readiness(now + 5)
+                        self.last_checked_block = current_block
+                except Exception as e:
+                    logger.debug(f"Event check failed: {e}")
+
+                # Check Countdown
+                time_until = next_window - now
+                if time_until <= 0:
+                    logger.info("Countdown hit zero. Attempting strike...")
+                    success = await self.execute_strike()
+                    if success:
+                        self.last_flush_time = time.time()
+                        logger.info("Strike successful. Timer reset.")
+                    else:
+                        logger.info("Strike condition not met or failed. Retrying next tick.")
                 else:
-                    await self.poll_readiness(next_epoch)
+                    # Log occasional status
+                    if int(now) % 60 == 0:
+                        logger.info(f"Waiting... Time until next window: {time_until:.2f}s")
 
-                # Sleep a bit to let the chain update before next sync
-                await asyncio.sleep(10)
+                # Poll interval
+                await asyncio.sleep(1)
 
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(1)
 
 if __name__ == "__main__":
     bot = EliteBot()
