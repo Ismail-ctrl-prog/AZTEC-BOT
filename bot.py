@@ -28,7 +28,7 @@ PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 MAX_GAS_GWEI = Decimal(os.getenv("MAX_GAS_GWEI", "3"))
 CONTRACT_ADDRESS = "0x7C9a7130379F1B5dd6e7A53AF84fC0fE32267B65"
 EPOCH_DURATION = 2304  # 38.4 minutes in seconds
-FLUSHED_TOPIC_HASH = "0xbf22ffbd5b2510ba175b84f0b24b0cf8d8f6eb19e2d498257976a51cc6660bf0"
+EVENT_SIGNATURE_HASH = "0xbf22ffbd5b2510ba175b84f0b24b0cf8d8f6eb19e2d498257976a51cc6660bf0"
 
 # Helper: Load ABI
 try:
@@ -74,7 +74,7 @@ class EliteBot:
         try:
             logs = await self.w3.eth.get_logs({
                 'address': CONTRACT_ADDRESS,
-                'topics': [FLUSHED_TOPIC_HASH],
+                'topics': [EVENT_SIGNATURE_HASH],
                 'from_block': from_block,
                 'to_block': to_block
             })
@@ -279,11 +279,19 @@ class EliteBot:
 
         logger.info(f"Connected to RPC. Address: {self.account.address if self.account else 'None'}")
 
-        # Initial Sync
+        # Initial Sync (Updated Logic)
         flush_ts = await self.perform_deep_scan()
         if flush_ts > 0:
             self.last_flush_time = flush_ts
             logger.info(f"Synced from chain. Last Flush: {self.last_flush_time}")
+
+            # Check if window is missed
+            next_window = self.last_flush_time + EPOCH_DURATION
+            if next_window < time.time():
+                logger.warning(f"Window missed (Expected: {next_window}, Now: {time.time()}).")
+                logger.info("Starting a fresh 38.4m cycle from the last detected event + 2304.")
+                # Shift the base time to the theoretical missed flush time
+                self.last_flush_time = next_window
         else:
             self.last_flush_time = time.time()
             logger.warning(f"Could not sync from chain. Fallback to Manual Sync: {self.last_flush_time}")
